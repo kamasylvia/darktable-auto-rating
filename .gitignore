@@ -1,6 +1,10 @@
+# custom
+._*
+.claude
+
+# predefined
 build*/
 obj*/
-*~
 *.pot
 *.mo
 doc/usermanual/darktable-usermanual*.pdf
@@ -27,3 +31,7 @@ CMakeLists.txt.user
 workspace/
 cmake-build-debug/
 .idea/
+.env
+
+# AI models (downloaded externally, not bundled)
+data/models/

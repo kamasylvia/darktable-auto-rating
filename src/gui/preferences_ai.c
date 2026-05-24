@@ -1106,6 +1106,22 @@ static void _on_delete_selected(GtkButton *button, gpointer user_data)
     for(GList *l = to_delete; l; l = g_list_next(l))
     {
       const char *model_id = (const char *)l->data;
+      // check if this model is the active one for its task before deleting
+      dt_ai_model_t *model = dt_ai_models_get_by_id(darktable.ai_registry, model_id);
+      if(model && model->task && model->task[0])
+      {
+        char *active = dt_ai_models_get_active_for_task(model->task);
+        if(active && g_strcmp0(active, model_id) == 0)
+        {
+          dt_ai_models_set_active_for_task(model->task, NULL);
+          dt_print(DT_DEBUG_AI,
+                   "[preferences_ai] cleared active model for task '%s'",
+                   model->task);
+        }
+        g_free(active);
+      }
+      if(model) dt_ai_model_free(model);
+
       if(dt_ai_models_delete(darktable.ai_registry, model_id))
       {
         dt_print(DT_DEBUG_AI, "[preferences_ai] deleted model: %s", model_id);

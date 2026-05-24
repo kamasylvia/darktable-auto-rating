@@ -45,6 +45,14 @@
       "min_version": "0.1",
       "github_asset": "upscale-bsrgan.dtmodel",
       "default": true
+    },
+    {
+      "id": "rating-aesthetic-v1",
+      "name": "aesthetic rating v1",
+      "description": "AI-powered aesthetic image quality scorer for automatic 1-5 star ratings",
+      "task": "rating",
+      "min_version": "0.1",
+      "default": true
     }
   ]
 }

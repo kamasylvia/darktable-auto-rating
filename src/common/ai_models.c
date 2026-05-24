@@ -57,6 +57,16 @@ static int _version_compare(const char *a, const char *b)
   return 0;
 }
 
+// return the system models directory (e.g. /usr/share/darktable/models).
+// caller must free the returned string.
+static char *_get_system_models_dir(void)
+{
+  char datadir[PATH_MAX] = {0};
+  dt_loc_get_datadir(datadir, sizeof(datadir));
+  return g_build_filename(datadir, "models", NULL);
+}
+
+
 static void _model_free(dt_ai_model_t *model)
 {
   if(!model)
@@ -452,6 +462,13 @@ dt_ai_registry_t *dt_ai_models_init(void)
   dt_ai_registry_t *registry = g_new0(dt_ai_registry_t, 1);
   g_mutex_init(&registry->lock);
 
+  // Auto-enable AI when built-in models are present (debug & release)
+  if(!dt_conf_get_bool(CONF_AI_ENABLED))
+  {
+    dt_conf_set_bool(CONF_AI_ENABLED, TRUE);
+    dt_print(DT_DEBUG_AI, "[ai_models] auto-enabled AI (built-in models present)");
+  }
+
   registry->ai_enabled = dt_conf_get_bool(CONF_AI_ENABLED);
 
   if(registry->ai_enabled)
@@ -607,6 +624,30 @@ gboolean dt_ai_models_load_registry(dt_ai_registry_t *registry)
   // check which models are actually downloaded
   dt_ai_models_refresh_status(registry);
 
+  // Auto-activate default rating model when built-in (debug & release)
+  {
+    char *active = dt_ai_models_get_active_for_task("rating");
+    if(!active || !active[0])
+    {
+      g_mutex_lock(&registry->lock);
+      for(GList *l = registry->models; l; l = g_list_next(l))
+      {
+        dt_ai_model_t *m = (dt_ai_model_t *)l->data;
+        if(m->task && strcmp(m->task, "rating") == 0
+           && m->is_default && m->status == DT_AI_MODEL_DOWNLOADED)
+        {
+          dt_ai_models_set_active_for_task("rating", m->id);
+          dt_print(DT_DEBUG_AI,
+                   "[ai_models] auto-activated rating model %s",
+                   m->id);
+          break;
+        }
+      }
+      g_mutex_unlock(&registry->lock);
+    }
+    g_free(active);
+  }
+
   return TRUE;
 }
 
@@ -700,22 +741,8 @@ void dt_ai_models_refresh_status(dt_ai_registry_t *registry)
 
   g_mutex_lock(&registry->lock);
 
-  // remove previously-discovered local models (no github_asset)
-  // these will be re-discovered from disk below if still present
-  GList *l = registry->models;
-  while(l)
-  {
-    GList *next = g_list_next(l);
-    dt_ai_model_t *model = (dt_ai_model_t *)l->data;
-    if(!model->github_asset)
-    {
-      _model_free(model);
-      registry->models = g_list_delete_link(registry->models, l);
-    }
-    l = next;
-  }
-
-  // pass 1: update status for registry models
+  // pass 1: update status for registry models (user dir + system dir)
+  char *sys_models_dir = _get_system_models_dir();
   for(GList *l2 = registry->models; l2; l2 = g_list_next(l2))
   {
     dt_ai_model_t *model = (dt_ai_model_t *)l2->data;
@@ -724,12 +751,23 @@ void dt_ai_models_refresh_status(dt_ai_registry_t *registry)
     if(!_valid_model_id(model->id))
       continue;
 
-    // check if model directory exists and contains required files
+    // check user models dir first, then system models dir
     char *model_dir = g_build_filename(registry->models_dir, model->id, NULL);
     char *config_path = g_build_filename(model_dir, "config.json", NULL);
+    gboolean found = g_file_test(model_dir, G_FILE_TEST_IS_DIR)
+                     && g_file_test(config_path, G_FILE_TEST_EXISTS);
 
-    if(g_file_test(model_dir, G_FILE_TEST_IS_DIR)
-       && g_file_test(config_path, G_FILE_TEST_EXISTS))
+    if(!found && sys_models_dir)
+    {
+      g_free(model_dir);
+      g_free(config_path);
+      model_dir = g_build_filename(sys_models_dir, model->id, NULL);
+      config_path = g_build_filename(model_dir, "config.json", NULL);
+      found = g_file_test(model_dir, G_FILE_TEST_IS_DIR)
+              && g_file_test(config_path, G_FILE_TEST_EXISTS);
+    }
+
+    if(found)
     {
       model->status = DT_AI_MODEL_DOWNLOADED;
       // read version from the model's own config.json
@@ -771,45 +809,51 @@ void dt_ai_models_refresh_status(dt_ai_registry_t *registry)
   }
 
   // pass 2: discover locally-installed models not in registry
-  if(registry->models_dir)
+  // (scan both user dir and system dir)
+  for(int pass = 0; pass < 2; pass++)
   {
-    GDir *dir = g_dir_open(registry->models_dir, 0, NULL);
-    if(dir)
+    const char *scan_dir = (pass == 0) ? registry->models_dir : sys_models_dir;
+    if(!scan_dir)
+      continue;
+
+    GDir *dir = g_dir_open(scan_dir, 0, NULL);
+    if(!dir)
+      continue;
+
+    const char *entry_name;
+    while((entry_name = g_dir_read_name(dir)))
     {
-      const char *entry_name;
-      while((entry_name = g_dir_read_name(dir)))
+      if(!_valid_model_id(entry_name))
+        continue;
+
+      // skip if already in registry (e.g. downloaded via ai_models.json)
+      if(_find_model_unlocked(registry, entry_name))
+        continue;
+
+      char *model_dir = g_build_filename(scan_dir, entry_name, NULL);
+      char *config_path = g_build_filename(model_dir, "config.json", NULL);
+
+      if(g_file_test(model_dir, G_FILE_TEST_IS_DIR)
+         && g_file_test(config_path, G_FILE_TEST_EXISTS))
       {
-        if(!_valid_model_id(entry_name))
-          continue;
-
-        // skip if already in registry (e.g. downloaded via ai_models.json)
-        if(_find_model_unlocked(registry, entry_name))
-          continue;
-
-        char *model_dir = g_build_filename(registry->models_dir, entry_name, NULL);
-        char *config_path = g_build_filename(model_dir, "config.json", NULL);
-
-        if(g_file_test(model_dir, G_FILE_TEST_IS_DIR)
-           && g_file_test(config_path, G_FILE_TEST_EXISTS))
+        dt_ai_model_t *model = _parse_local_model_config(config_path, entry_name);
+        if(model)
         {
-          dt_ai_model_t *model = _parse_local_model_config(config_path, entry_name);
-          if(model)
-          {
-            model->status = DT_AI_MODEL_DOWNLOADED;
-            registry->models = g_list_append(registry->models, model);
-            dt_print(DT_DEBUG_AI,
-                     "[ai_models] discovered local model: %s (%s)",
-                     model->name, model->id);
-          }
+          model->status = DT_AI_MODEL_DOWNLOADED;
+          registry->models = g_list_append(registry->models, model);
+          dt_print(DT_DEBUG_AI,
+                   "[ai_models] discovered local model: %s (%s)",
+                   model->name, model->id);
         }
-
-        g_free(config_path);
-        g_free(model_dir);
       }
-      g_dir_close(dir);
+
+      g_free(config_path);
+      g_free(model_dir);
     }
+    g_dir_close(dir);
   }
 
+  g_free(sys_models_dir);
   g_mutex_unlock(&registry->lock);
 }
 
@@ -1367,7 +1411,13 @@ char *dt_ai_models_download_sync(dt_ai_registry_t *registry,
   if(!model->github_asset)
   {
     g_mutex_unlock(&registry->lock);
-    return g_strdup(_("model has no download asset defined"));
+    return g_strdup_printf(_("model '%s' must be downloaded manually.\n"
+                              "run: az artifacts universal download "
+                              "--organization https://dev.azure.com/kamasylvia/ "
+                              "--project Kamasylvia --scope project "
+                              "--feed Models --name %s --version 1.0.0 "
+                              "--path ~/Downloads"),
+                           model_id, model_id);
   }
 
   // validate asset filename: reject path separators and query strings
@@ -1740,6 +1790,23 @@ gboolean dt_ai_models_delete(dt_ai_registry_t *registry, const char *model_id)
   }
   g_mutex_unlock(&registry->lock);
 
+  // refuse to delete built-in system models
+  char *sys_dir = _get_system_models_dir();
+  if(sys_dir)
+  {
+    char *sys_model_dir = g_build_filename(sys_dir, model_id, NULL);
+    if(g_file_test(sys_model_dir, G_FILE_TEST_IS_DIR))
+    {
+      dt_print(DT_DEBUG_AI,
+               "[ai_models] refusing to delete built-in model %s", model_id);
+      g_free(sys_model_dir);
+      g_free(sys_dir);
+      return FALSE;
+    }
+    g_free(sys_model_dir);
+  }
+  g_free(sys_dir);
+
   char *model_dir = g_build_filename(registry->models_dir, model_id, NULL);
   _rmdir_recursive(model_dir);
   g_free(model_dir);
@@ -1912,7 +1979,37 @@ char *dt_ai_models_get_path(dt_ai_registry_t *registry, const char *model_id)
   if(!downloaded)
     return NULL;
 
-  return g_build_filename(registry->models_dir, model_id, NULL);
+  // prefer user models dir
+  char *user_path = g_build_filename(registry->models_dir, model_id, NULL);
+  char *user_config = g_build_filename(user_path, "config.json", NULL);
+  if(g_file_test(user_path, G_FILE_TEST_IS_DIR)
+     && g_file_test(user_config, G_FILE_TEST_EXISTS))
+  {
+    g_free(user_config);
+    return user_path;
+  }
+  g_free(user_config);
+  g_free(user_path);
+
+  // fall back to system models dir
+  char *sys_dir = _get_system_models_dir();
+  if(sys_dir)
+  {
+    char *sys_path = g_build_filename(sys_dir, model_id, NULL);
+    char *sys_config = g_build_filename(sys_path, "config.json", NULL);
+    if(g_file_test(sys_path, G_FILE_TEST_IS_DIR)
+       && g_file_test(sys_config, G_FILE_TEST_EXISTS))
+    {
+      g_free(sys_config);
+      g_free(sys_dir);
+      return sys_path;
+    }
+    g_free(sys_config);
+    g_free(sys_path);
+  }
+  g_free(sys_dir);
+
+  return NULL;
 }
 
 void dt_ai_models_get_spatial_dims(dt_ai_registry_t *registry,

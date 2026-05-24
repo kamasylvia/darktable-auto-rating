@@ -26,6 +26,14 @@
 #include <limits.h>
 #include <string.h>
 
+#ifndef PATH_MAX
+#ifdef _WIN32
+#define PATH_MAX _MAX_PATH
+#else
+#define PATH_MAX 4096
+#endif
+#endif
+
 // provider table
 
 // clang-format off
@@ -248,8 +256,9 @@ static void _scan_directory(dt_ai_environment_t *env, const char *root_path)
   g_dir_close(dir);
 }
 
-// scan search_paths + XDG data dir fallback. duplicate IDs are
-// rejected by _scan_directory (first-seen wins)
+// scan search_paths + XDG data dir fallback + system datadir for
+// built-in models. duplicate IDs are rejected by _scan_directory
+// (first-seen wins)
 static void _scan_all_paths(dt_ai_environment_t *env)
 {
   if(env->search_paths && env->search_paths[0])
@@ -263,6 +272,13 @@ static void _scan_all_paths(dt_ai_environment_t *env)
   char *datadir = g_build_filename(g_get_user_data_dir(), "darktable", "models", NULL);
   _scan_directory(env, datadir);
   g_free(datadir);
+
+  // scan system data directory for built-in models
+  char sys_datadir[PATH_MAX] = {0};
+  dt_loc_get_datadir(sys_datadir, sizeof(sys_datadir));
+  char *sys_models = g_build_filename(sys_datadir, "models", NULL);
+  _scan_directory(env, sys_models);
+  g_free(sys_models);
 }
 
 // API implementation

@@ -467,6 +467,7 @@ if(USE_AI)
     "common/ai/restore_rgb.c"
     "common/ai/restore_raw_bayer.c"
     "common/ai/restore_raw_linear.c"
+    "common/ai/aesthetic_rating.c"
     "develop/masks/object.c"
     "gui/preferences_ai.c"
   )
