@@ -736,7 +736,7 @@ static gboolean _valid_model_id(const char *model_id)
 
 void dt_ai_models_refresh_status(dt_ai_registry_t *registry)
 {
-  if(!registry)
+  if(!registry || !registry->models_dir)
     return;
 
   g_mutex_lock(&registry->lock);

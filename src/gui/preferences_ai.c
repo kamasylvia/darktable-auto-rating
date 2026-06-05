@@ -194,6 +194,12 @@ static void _update_download_selected_sensitivity(dt_prefs_ai_data_t *data)
 
 static void _refresh_model_list(dt_prefs_ai_data_t *data)
 {
+  if(!data || !data->model_store)
+  {
+    dt_print(DT_DEBUG_AI, "[preferences_ai] data or model_store is NULL");
+    return;
+  }
+
   if(!darktable.ai_registry)
   {
     dt_print(DT_DEBUG_AI, "[preferences_ai] registry is NULL");
