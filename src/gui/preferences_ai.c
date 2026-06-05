@@ -105,7 +105,48 @@ typedef struct dt_prefs_ai_data_t
   GtkWidget *settings_grid;
   int controls_start_row;   // first row to grey out when AI disabled
   guint supported_providers;
+
+  // rating threshold controls (shown when a rating model is selected)
+  GtkWidget *threshold_grid;
+  GtkWidget *threshold_check[7];
+  GtkWidget *threshold_scale[7];
+  GtkWidget *threshold_value[7];
 } dt_prefs_ai_data_t;
+
+// --- rating threshold constants ---
+
+static const char *_rating_names[7] = {
+  N_("reject"), N_("0 star"), N_("1 star"), N_("2 star"),
+  N_("3 star"), N_("4 star"), N_("5 star")
+};
+
+static const char *_rating_conf_keys[7] = {
+  "plugins/ai/rating_threshold_reject",
+  "plugins/ai/rating_threshold_0star",
+  "plugins/ai/rating_threshold_1star",
+  "plugins/ai/rating_threshold_2star",
+  "plugins/ai/rating_threshold_3star",
+  "plugins/ai/rating_threshold_4star",
+  "plugins/ai/rating_threshold_5star"
+};
+
+static const char *_rating_enabled_keys[7] = {
+  "plugins/ai/rating_threshold_reject_enabled",
+  "plugins/ai/rating_threshold_0star_enabled",
+  "plugins/ai/rating_threshold_1star_enabled",
+  "plugins/ai/rating_threshold_2star_enabled",
+  "plugins/ai/rating_threshold_3star_enabled",
+  "plugins/ai/rating_threshold_4star_enabled",
+  "plugins/ai/rating_threshold_5star_enabled"
+};
+
+static const float _rating_defaults[7] = {
+  0.00f, 0.10f, 0.25f, 0.40f, 0.55f, 0.72f, 0.88f
+};
+
+static const gboolean _rating_default_enabled[7] = {
+  FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE
+};
 
 #ifdef HAVE_AI_DOWNLOAD
 // download dialog data
@@ -276,6 +317,326 @@ static void _refresh_model_list(dt_prefs_ai_data_t *data)
 #ifdef HAVE_AI_DOWNLOAD
   _update_download_selected_sensitivity(data);
 #endif
+}
+
+// --- rating threshold helpers ---
+
+/* Fix any out-of-order thresholds after loading from config.
+   Pushes higher neighbours up; if that hits 1.0, pulls the lower
+   neighbour down instead.  Only runs at load time. */
+static void _sanitize_threshold_order(dt_prefs_ai_data_t *data)
+{
+  const float min_gap = 0.01f;
+
+  for(int i = 0; i < 6; )
+  {
+    if(!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(data->threshold_check[i])))
+    {
+      i++;
+      continue;
+    }
+
+    int next = i + 1;
+    while(next < 7
+          && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(data->threshold_check[next])))
+      next++;
+    if(next >= 7) break;
+
+    const float val_i = gtk_range_get_value(GTK_RANGE(data->threshold_scale[i]));
+    const float val_next = gtk_range_get_value(GTK_RANGE(data->threshold_scale[next]));
+
+    if(val_next <= val_i + min_gap)
+    {
+      float new_next = val_i + min_gap;
+      if(new_next > 1.0f)
+      {
+        // Cannot push next up; pull current down instead
+        float new_i = val_next - min_gap;
+        if(new_i >= 0.0f && new_i != val_i)
+        {
+          gtk_range_set_value(GTK_RANGE(data->threshold_scale[i]), new_i);
+          dt_conf_set_float(_rating_conf_keys[i], new_i);
+          if(data->threshold_value[i])
+          {
+            gchar *txt = g_strdup_printf("%.2f", new_i);
+            gtk_entry_set_text(GTK_ENTRY(data->threshold_value[i]), txt);
+            g_free(txt);
+          }
+          // Re-check from same i since we modified it
+          continue;
+        }
+      }
+      else if(new_next != val_next)
+      {
+        gtk_range_set_value(GTK_RANGE(data->threshold_scale[next]), new_next);
+        dt_conf_set_float(_rating_conf_keys[next], new_next);
+        if(data->threshold_value[next])
+        {
+          gchar *txt = g_strdup_printf("%.2f", new_next);
+          gtk_entry_set_text(GTK_ENTRY(data->threshold_value[next]), txt);
+          g_free(txt);
+        }
+        // Re-check from same i since we may need to cascade
+        continue;
+      }
+      // No change possible (already at boundary), advance to avoid infinite loop
+      i = next;
+      continue;
+    }
+
+    i = next;
+  }
+}
+
+static void _load_threshold_values(dt_prefs_ai_data_t *data)
+{
+  for(int i = 0; i < 7; i++)
+  {
+    const float def = _rating_defaults[i];
+    const float val = dt_conf_key_exists(_rating_conf_keys[i])
+                        ? dt_conf_get_float(_rating_conf_keys[i])
+                        : def;
+    const gboolean enabled = dt_conf_key_exists(_rating_enabled_keys[i])
+                               ? dt_conf_get_bool(_rating_enabled_keys[i])
+                               : _rating_default_enabled[i];
+    if(data->threshold_scale[i])
+      gtk_range_set_value(GTK_RANGE(data->threshold_scale[i]), val);
+    if(data->threshold_check[i])
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(data->threshold_check[i]), enabled);
+    if(data->threshold_value[i])
+    {
+      gchar *txt = g_strdup_printf("%.2f", val);
+      gtk_entry_set_text(GTK_ENTRY(data->threshold_value[i]), txt);
+      g_free(txt);
+    }
+  }
+  _sanitize_threshold_order(data);
+}
+
+/* Clamp a threshold value so it stays strictly between its enabled
+   neighbours (minimum 0.01 gap).  Only the dragged slider is modified. */
+static float _clamp_threshold_value(dt_prefs_ai_data_t *data, int idx, float val)
+{
+  const float min_gap = 0.01f;
+
+  // nearest enabled lower rating (smaller index)
+  int lower = idx - 1;
+  while(lower >= 0
+        && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(data->threshold_check[lower])))
+    lower--;
+  if(lower >= 0)
+  {
+    const float lower_val = gtk_range_get_value(GTK_RANGE(data->threshold_scale[lower]));
+    const float min_allowed = lower_val + min_gap;
+    if(val < min_allowed)
+      val = min_allowed;
+  }
+
+  // nearest enabled higher rating (larger index)
+  int higher = idx + 1;
+  while(higher < 7
+        && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(data->threshold_check[higher])))
+    higher++;
+  if(higher < 7)
+  {
+    const float higher_val = gtk_range_get_value(GTK_RANGE(data->threshold_scale[higher]));
+    const float max_allowed = higher_val - min_gap;
+    if(val > max_allowed)
+      val = max_allowed;
+  }
+
+  return val;
+}
+
+static gboolean _on_threshold_scroll_event(GtkWidget *widget,
+                                           GdkEventScroll *event,
+                                           gpointer user_data)
+{
+  dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  int idx = -1;
+  for(int i = 0; i < 7; i++)
+  {
+    if(data->threshold_scale[i] == widget)
+    {
+      idx = i;
+      break;
+    }
+  }
+  if(idx < 0) return FALSE;
+
+  GtkRange *range = GTK_RANGE(widget);
+  const double current = gtk_range_get_value(range);
+  const double step = 0.01;
+  double delta = 0.0;
+
+  switch(event->direction)
+  {
+    case GDK_SCROLL_UP:
+      delta = step;
+      break;
+    case GDK_SCROLL_DOWN:
+      delta = -step;
+      break;
+    case GDK_SCROLL_LEFT:
+      delta = -step;
+      break;
+    case GDK_SCROLL_RIGHT:
+      delta = step;
+      break;
+    case GDK_SCROLL_SMOOTH:
+      delta = -event->delta_y * step;
+      if(delta == 0.0 && event->delta_x != 0.0)
+        delta = (event->delta_x > 0.0 ? step : -step);
+      break;
+    default:
+      return FALSE;
+  }
+
+  if(delta == 0.0) return FALSE;
+
+  const double new_val = CLAMP(current + delta, 0.0, 1.0);
+  const float clamped = _clamp_threshold_value(data, idx, (float)new_val);
+  if(clamped != gtk_range_get_value(range))
+  {
+    gtk_range_set_value(range, clamped);
+    dt_conf_set_float(_rating_conf_keys[idx], clamped);
+  }
+  // Always consume the event so GTK's default scroll handler
+  // (which uses a much larger page increment) cannot run.
+  return TRUE;
+}
+
+static void _on_threshold_scale_changed(GtkRange *range, gpointer user_data)
+{
+  dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  int idx = -1;
+  for(int i = 0; i < 7; i++)
+  {
+    if(data->threshold_scale[i] == GTK_WIDGET(range))
+    {
+      idx = i;
+      break;
+    }
+  }
+  if(idx < 0) return;
+
+  const float val = gtk_range_get_value(range);
+
+  if(data->threshold_value[idx])
+  {
+    gchar *txt = g_strdup_printf("%.2f", val);
+    gtk_entry_set_text(GTK_ENTRY(data->threshold_value[idx]), txt);
+    g_free(txt);
+  }
+}
+
+// block all mouse button presses on scales to prevent drag
+static gboolean _on_threshold_scale_button_press(GtkWidget *widget,
+                                                   GdkEventButton *event,
+                                                   gpointer user_data)
+{
+  return TRUE;
+}
+
+// apply a value typed into the entry, clamped to neighbour constraints
+static void _on_threshold_value_activate(GtkEntry *entry, gpointer user_data)
+{
+  dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  int idx = -1;
+  for(int i = 0; i < 7; i++)
+  {
+    if(data->threshold_value[i] == GTK_WIDGET(entry))
+    {
+      idx = i;
+      break;
+    }
+  }
+  if(idx < 0) return;
+
+  const char *text = gtk_entry_get_text(entry);
+  float val = (float)g_ascii_strtod(text, NULL);
+  val = CLAMP(val, 0.0f, 1.0f);
+  const float clamped = _clamp_threshold_value(data, idx, val);
+
+  g_signal_handlers_block_by_func(data->threshold_scale[idx],
+                                  _on_threshold_scale_changed, data);
+  gtk_range_set_value(GTK_RANGE(data->threshold_scale[idx]), clamped);
+  g_signal_handlers_unblock_by_func(data->threshold_scale[idx],
+                                    _on_threshold_scale_changed, data);
+  dt_conf_set_float(_rating_conf_keys[idx], clamped);
+
+  gchar *txt = g_strdup_printf("%.2f", clamped);
+  gtk_entry_set_text(GTK_ENTRY(data->threshold_value[idx]), txt);
+  g_free(txt);
+}
+
+static void _on_threshold_enabled_toggled(GtkToggleButton *toggle, gpointer user_data)
+{
+  dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  int idx = -1;
+  for(int i = 0; i < 7; i++)
+  {
+    if(data->threshold_check[i] == GTK_WIDGET(toggle))
+    {
+      idx = i;
+      break;
+    }
+  }
+  if(idx < 0) return;
+
+  const gboolean enabled = gtk_toggle_button_get_active(toggle);
+  dt_conf_set_bool(_rating_enabled_keys[idx], enabled);
+  if(data->threshold_scale[idx])
+    gtk_widget_set_sensitive(data->threshold_scale[idx], enabled);
+}
+
+static void _on_threshold_reset_clicked(GtkButton *button, gpointer user_data)
+{
+  dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  for(int i = 0; i < 7; i++)
+  {
+    dt_conf_set_float(_rating_conf_keys[i], _rating_defaults[i]);
+    dt_conf_set_bool(_rating_enabled_keys[i], _rating_default_enabled[i]);
+  }
+  _load_threshold_values(data);
+}
+
+static void _update_threshold_visibility(dt_prefs_ai_data_t *data)
+{
+  if(!data->threshold_grid) return;
+
+  GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(data->model_list));
+  GtkTreeIter iter;
+  gboolean has_sel = gtk_tree_selection_get_selected(sel, NULL, &iter);
+  gboolean show = FALSE;
+  gchar *task = NULL;
+
+  if(has_sel)
+  {
+    gtk_tree_model_get(GTK_TREE_MODEL(data->model_store), &iter,
+                       COL_TASK, &task, -1);
+    show = (task && strcmp(task, "rating") == 0);
+  }
+
+  g_free(task);
+
+  if(show)
+  {
+    _load_threshold_values(data);
+    gtk_widget_set_no_show_all(data->threshold_grid, FALSE);
+    gtk_widget_show_all(data->threshold_grid);
+    gtk_widget_set_no_show_all(data->threshold_grid, TRUE);
+  }
+  else
+  {
+    gtk_widget_hide(data->threshold_grid);
+  }
+}
+
+static void _on_model_selection_changed(GtkTreeSelection *sel, gpointer user_data)
+{
+  dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  _update_threshold_visibility(data);
 }
 
 static void _update_controls_sensitivity(dt_prefs_ai_data_t *data, gboolean enabled)
@@ -1312,6 +1673,7 @@ static gboolean _on_info_button_press(GtkWidget *widget,
     return FALSE;
 
   dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
+  _update_threshold_visibility(data);
   GtkTreeView *tv = GTK_TREE_VIEW(widget);
   GtkTreePath *path = NULL;
   GtkTreeViewColumn *column = NULL;
@@ -1875,6 +2237,9 @@ void init_tab_ai(GtkWidget *dialog, GtkWidget *stack)
                    G_CALLBACK(_on_tree_motion), data);
   g_signal_connect(data->model_list, "button-press-event",
                    G_CALLBACK(_on_info_button_press), data);
+  GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(data->model_list));
+  g_signal_connect(sel, "changed",
+                   G_CALLBACK(_on_model_selection_changed), data);
 
   // scrolled window for the list
   GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
@@ -1947,6 +2312,70 @@ void init_tab_ai(GtkWidget *dialog, GtkWidget *stack)
   g_signal_connect(help_btn, "clicked", G_CALLBACK(dt_gui_show_help), NULL);
   gtk_box_pack_end(GTK_BOX(button_box), help_btn, FALSE, FALSE, 0);
 
+  // --- rating thresholds section (shown when a rating model is selected) ---
+  data->threshold_grid = gtk_grid_new();
+  gtk_grid_set_row_spacing(GTK_GRID(data->threshold_grid), DT_PIXEL_APPLY_DPI(4));
+  gtk_grid_set_column_spacing(GTK_GRID(data->threshold_grid), DT_PIXEL_APPLY_DPI(8));
+  gtk_widget_set_margin_top(data->threshold_grid, DT_PIXEL_APPLY_DPI(12));
+  gtk_widget_set_no_show_all(data->threshold_grid, TRUE);
+  gtk_widget_hide(data->threshold_grid);
+
+  {
+    GtkWidget *seclabel = gtk_label_new(_("rating thresholds"));
+    GtkWidget *reset_btn = gtk_button_new_with_label(_("reset to defaults"));
+    gtk_widget_set_tooltip_text(reset_btn, _("reset all rating thresholds to their default values"));
+    g_signal_connect(reset_btn, "clicked", G_CALLBACK(_on_threshold_reset_clicked), data);
+
+    GtkWidget *lbox = dt_gui_hbox(seclabel);
+    gtk_box_pack_end(GTK_BOX(lbox), reset_btn, FALSE, FALSE, 0);
+    gtk_widget_set_name(lbox, "pref_section");
+    gtk_grid_attach(GTK_GRID(data->threshold_grid), lbox, 0, 0, 4, 1);
+  }
+
+  for(int i = 0; i < 7; i++)
+  {
+    const int r = i + 1;
+
+    data->threshold_check[i] = gtk_check_button_new();
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(data->threshold_check[i]),
+                                 _rating_default_enabled[i]);
+    g_signal_connect(data->threshold_check[i], "toggled",
+                     G_CALLBACK(_on_threshold_enabled_toggled), data);
+
+    GtkWidget *name_label = gtk_label_new(_(_rating_names[i]));
+    gtk_widget_set_halign(name_label, GTK_ALIGN_START);
+
+    data->threshold_scale[i]
+      = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 1.0, 0.05);
+    gtk_scale_set_digits(GTK_SCALE(data->threshold_scale[i]), 2);
+    gtk_range_set_increments(GTK_RANGE(data->threshold_scale[i]), 0.01, 0.05);
+    gtk_range_set_value(GTK_RANGE(data->threshold_scale[i]), _rating_defaults[i]);
+    gtk_widget_set_hexpand(data->threshold_scale[i], TRUE);
+    g_signal_connect(data->threshold_scale[i], "value-changed",
+                     G_CALLBACK(_on_threshold_scale_changed), data);
+    g_signal_connect(data->threshold_scale[i], "button-press-event",
+                     G_CALLBACK(_on_threshold_scale_button_press), data);
+    g_signal_connect(data->threshold_scale[i], "scroll-event",
+                     G_CALLBACK(_on_threshold_scroll_event), data);
+
+    data->threshold_value[i] = gtk_entry_new();
+    gtk_entry_set_width_chars(GTK_ENTRY(data->threshold_value[i]), 5);
+    gtk_entry_set_max_length(GTK_ENTRY(data->threshold_value[i]), 5);
+    gchar *txt = g_strdup_printf("%.2f", _rating_defaults[i]);
+    gtk_entry_set_text(GTK_ENTRY(data->threshold_value[i]), txt);
+    g_free(txt);
+    gtk_widget_set_halign(data->threshold_value[i], GTK_ALIGN_START);
+    g_signal_connect(data->threshold_value[i], "activate",
+                     G_CALLBACK(_on_threshold_value_activate), data);
+
+    gtk_grid_attach(GTK_GRID(data->threshold_grid), data->threshold_check[i], 0, r, 1, 1);
+    gtk_grid_attach(GTK_GRID(data->threshold_grid), name_label,              1, r, 1, 1);
+    gtk_grid_attach(GTK_GRID(data->threshold_grid), data->threshold_scale[i], 2, r, 1, 1);
+    gtk_grid_attach(GTK_GRID(data->threshold_grid), data->threshold_value[i], 3, r, 1, 1);
+  }
+
+  gtk_grid_attach(GTK_GRID(models_grid), data->threshold_grid, 0, row++, 1, 1);
+
   dt_gui_box_add(data->controls_box, models_grid);
 
   // wrap in a scrolled container like other tabs
@@ -1958,6 +2387,11 @@ void init_tab_ai(GtkWidget *dialog, GtkWidget *stack)
 
   // populate model list
   _refresh_model_list(data);
+
+  // clear any default selection so threshold area starts hidden
+  gtk_tree_selection_unselect_all(
+    gtk_tree_view_get_selection(GTK_TREE_VIEW(data->model_list)));
+  _update_threshold_visibility(data);
 
   // store data pointer for cleanup (attach to container)
   g_object_set_data_full(G_OBJECT(tab_box), "prefs-ai-data", data, g_free);

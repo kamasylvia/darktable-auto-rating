@@ -69,8 +69,15 @@ static void _apply_rating_no_gui(const dt_imgid_t imgid, const int rating)
   dt_image_t *image = dt_image_cache_get(imgid, 'w');
   if(image)
   {
-    image->flags = (image->flags & ~(DT_IMAGE_REJECTED | DT_VIEW_RATINGS_MASK))
-                   | (DT_VIEW_RATINGS_MASK & rating);
+    if(rating == -1)
+    {
+      image->flags = (image->flags & ~DT_VIEW_RATINGS_MASK) | DT_IMAGE_REJECTED;
+    }
+    else
+    {
+      image->flags = (image->flags & ~(DT_IMAGE_REJECTED | DT_VIEW_RATINGS_MASK))
+                     | (DT_VIEW_RATINGS_MASK & rating);
+    }
     dt_image_cache_write_release_info(image, DT_IMAGE_CACHE_SAFE,
                                       "auto_rating_apply");
   }
@@ -144,7 +151,7 @@ static int32_t _auto_rating_job_run(dt_job_t *job)
     const dt_imgid_t imgid = GPOINTER_TO_INT(l->data);
     const int stars = dt_ai_rating_score_image(rating, imgid);
 
-    if(stars > 0)
+    if(stars >= -1 && stars <= 5)
     {
       _apply_rating_no_gui(imgid, stars);
       jd->rated = g_list_prepend(jd->rated, GINT_TO_POINTER(imgid));
@@ -283,7 +290,7 @@ void gui_init(dt_lib_module_t *self)
   dt_action_t *ac = dt_action_define(&darktable.control->actions_global, NULL,
                                      N_("auto-rating"), d->button,
                                      &dt_action_def_button);
-  dt_shortcut_register(ac, 0, 0, GDK_KEY_a, GDK_CONTROL_MASK);
+  dt_shortcut_register(ac, 0, 0, GDK_KEY_F8, 0);
 }
 
 void gui_cleanup(dt_lib_module_t *self)

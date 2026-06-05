@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/mipmap_cache.h"
+#include "control/conf.h"
 #include "ai/backend.h"
 
 #include <math.h>
@@ -54,6 +55,8 @@ struct dt_ai_rating_t
   int input_size;       // model input H = W (square)
   gboolean normalize;   // TRUE = ImageNet mean/std, FALSE = [0,1]
   gboolean nima_output; // TRUE = 10-class probability distribution (NIMA)
+  float threshold[7];   // user-defined thresholds for reject, 0-5 stars
+  gboolean threshold_enabled[7];
 };
 
 /* --- image preprocessing --- */
@@ -179,6 +182,42 @@ dt_ai_rating_t *dt_ai_rating_init(void)
   rating->normalize = normalize;
   rating->nima_output = nima_output;
 
+  // load user-defined rating thresholds
+  static const char *threshold_keys[7] = {
+    "plugins/ai/rating_threshold_reject",
+    "plugins/ai/rating_threshold_0star",
+    "plugins/ai/rating_threshold_1star",
+    "plugins/ai/rating_threshold_2star",
+    "plugins/ai/rating_threshold_3star",
+    "plugins/ai/rating_threshold_4star",
+    "plugins/ai/rating_threshold_5star"
+  };
+  static const char *enabled_keys[7] = {
+    "plugins/ai/rating_threshold_reject_enabled",
+    "plugins/ai/rating_threshold_0star_enabled",
+    "plugins/ai/rating_threshold_1star_enabled",
+    "plugins/ai/rating_threshold_2star_enabled",
+    "plugins/ai/rating_threshold_3star_enabled",
+    "plugins/ai/rating_threshold_4star_enabled",
+    "plugins/ai/rating_threshold_5star_enabled"
+  };
+  static const float defaults[7] = {
+    0.00f, 0.10f, 0.25f, 0.40f, 0.55f, 0.72f, 0.88f
+  };
+  static const gboolean default_enabled[7] = {
+    FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE
+  };
+
+  for(int i = 0; i < 7; i++)
+  {
+    rating->threshold[i] = dt_conf_key_exists(threshold_keys[i])
+                             ? dt_conf_get_float(threshold_keys[i])
+                             : defaults[i];
+    rating->threshold_enabled[i] = dt_conf_key_exists(enabled_keys[i])
+                                     ? dt_conf_get_bool(enabled_keys[i])
+                                     : default_enabled[i];
+  }
+
   dt_print(DT_DEBUG_AI,
            "[aesthetic_rating] initialized model '%s' input_size=%d normalize=%d nima_output=%d",
            model_id, input_size, normalize, nima_output);
@@ -297,19 +336,37 @@ int dt_ai_rating_score_image(dt_ai_rating_t *rating, const dt_imgid_t imgid)
   if(score < 0.0f) score = 0.0f;
   if(score > 1.0f) score = 1.0f;
 
-  /* Map to 1-4 stars using extremely harsh thresholds.
-     5 stars is reserved for manual rating only.
-     NIMA scores on AVA cluster around the mean (~5.3/10); we push
-     the mapping even further so that 1-2 stars dominate and only
-     exceptional photos reach 3-4.
-       1 star : ~45%  (score < 0.45)
-       2 stars: ~30%  (0.45 <= score < 0.60)
-       3 stars: ~18%  (0.60 <= score < 0.78)
-       4 stars: ~7%   (score >= 0.78)
-  */
-  const int stars = (score < 0.45f) ? 1 :
-                    (score < 0.60f) ? 2 :
-                    (score < 0.78f) ? 3 : 4;
+  // Map score to rating using user-defined thresholds.
+  // Thresholds are ordered: [reject, 0-star, 1-star, 2-star, 3-star, 4-star, 5-star]
+  // Rating values: reject=-1, 0-star=0, 1-star=1, ..., 5-star=5
+  // Walk from highest rating downward; first enabled threshold that score meets wins.
+  static const int rating_values[7] = { -1, 0, 1, 2, 3, 4, 5 };
+  int stars = 1; // fallback
+  gboolean found = FALSE;
+
+  for(int i = 6; i >= 0; i--)
+  {
+    if(!rating->threshold_enabled[i]) continue;
+    if(score >= rating->threshold[i])
+    {
+      stars = rating_values[i];
+      found = TRUE;
+      break;
+    }
+  }
+
+  // If nothing matched (e.g. all thresholds above score), use the lowest enabled rating.
+  if(!found)
+  {
+    for(int i = 0; i < 7; i++)
+    {
+      if(rating->threshold_enabled[i])
+      {
+        stars = rating_values[i];
+        break;
+      }
+    }
+  }
 
   dt_print(DT_DEBUG_AI,
            "[aesthetic_rating] image %d score=%.3f -> %d stars",
