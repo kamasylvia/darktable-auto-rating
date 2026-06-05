@@ -1,0 +1,156 @@
+# Azure Pipeline: Sync upstream from GitHub to Azure DevOps main
+# Fixes: fetchDepth issue that prevented proper merge
+
+trigger:
+  branches:
+    include:
+      - main
+
+schedules:
+  - cron: "0 0 * * *"
+    displayName: "Sync upstream daily at midnight"
+    branches:
+      include:
+        - main
+    always: true
+
+variables:
+  # Change these when copying to another project
+  upstreamOwnerRepo: 'darktable-org/darktable'  # GitHub owner/repo path
+  targetBranch: 'main'
+
+  # Derived variables (don't change)
+  upstreamRepo: 'https://github.com/$(upstreamOwnerRepo).git'
+  upstreamApiUrl: 'https://api.github.com/repos/$(upstreamOwnerRepo)'
+
+stages:
+  - stage: SyncUpstream
+    displayName: 'Sync Upstream Repository'
+    jobs:
+      - job: SyncAndMerge
+        displayName: 'Sync and Merge'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0  # FIX: Get full history for proper merge base calculation
+
+          - script: |
+              echo "=== Configuring git ==="
+              git config user.name "Azure Pipelines"
+              git config user.email "azurepipelines@$(Build.DefinitionName)"
+
+              echo "=== Adding upstream remote ==="
+              git remote add upstream $(upstreamRepo) || git remote set-url upstream $(upstreamRepo)
+
+              echo "=== Detecting upstream default branch ==="
+              UPSTREAM_BRANCH=$(curl -s "$(upstreamApiUrl)" | jq -r '.default_branch')
+              echo "Upstream default branch: $UPSTREAM_BRANCH"
+
+              echo "=== Fetching upstream with full history ==="
+              # FIX: Fetch with enough depth to find common ancestor
+              git fetch upstream "$UPSTREAM_BRANCH" --depth=500
+
+              echo "=== Current state ==="
+              echo "Local HEAD: $(git rev-parse HEAD)"
+              echo "Upstream HEAD: $(git rev-parse upstream/$UPSTREAM_BRANCH)"
+              echo "Merge base: $(git merge-base HEAD upstream/$UPSTREAM_BRANCH 2>/dev/null || echo 'No common ancestor')"
+            displayName: 'Setup and detect upstream branch'
+
+          - script: |
+              echo "=== Checking if already up-to-date ==="
+              UPSTREAM_BRANCH=$(curl -s "$(upstreamApiUrl)" | jq -r '.default_branch')
+              
+              LOCAL=$(git rev-parse HEAD)
+              UPSTREAM=$(git rev-parse upstream/$UPSTREAM_BRANCH)
+              
+              if [ "$LOCAL" = "$UPSTREAM" ]; then
+                echo "Already up-to-date, no sync needed"
+                exit 0
+              fi
+              
+              echo "=== Checking merge base ==="
+              MERGE_BASE=$(git merge-base HEAD upstream/$UPSTREAM_BRANCH 2>/dev/null || echo "")
+              
+              if [ -z "$MERGE_BASE" ]; then
+                echo "=== No common ancestor, doing hard reset ==="
+                git reset --hard upstream/$UPSTREAM_BRANCH
+                
+                # Preserve CI config
+                echo "=== Restoring CI config ==="
+                git checkout HEAD -- .azure-pipelines/ || true
+                if [ -n "$(git status --porcelain)" ]; then
+                  git add .azure-pipelines/
+                  git commit -m "Restore CI config [skip ci]"
+                fi
+              else
+                echo "=== Have common ancestor: $MERGE_BASE ==="
+                
+                # Check if we're behind upstream
+                BEHIND=$(git rev-list --count HEAD..upstream/$UPSTREAM_BRANCH)
+                AHEAD=$(git rev-list --count upstream/$UPSTREAM_BRANCH..HEAD)
+                
+                echo "Behind upstream by: $BEHIND commits"
+                echo "Ahead of upstream by: $AHEAD commits"
+                
+                if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
+                  echo "=== Fast-forward possible, resetting to upstream ==="
+                  git reset --hard upstream/$UPSTREAM_BRANCH
+                  
+                  # Preserve CI config if it exists locally
+                  echo "=== Checking for local CI config ==="
+                  git stash push -m "CI config backup" .azure-pipelines/ 2>/dev/null || true
+                  git reset --hard upstream/$UPSTREAM_BRANCH
+                  git stash pop 2>/dev/null || true
+                  
+                  if [ -n "$(git status --porcelain)" ]; then
+                    git add .azure-pipelines/
+                    git commit -m "Preserve CI config during sync [skip ci]"
+                  fi
+                elif [ "$BEHIND" -gt 0 ]; then
+                  echo "=== Need to merge upstream changes ==="
+                  git merge upstream/$UPSTREAM_BRANCH --no-edit -m "Merge upstream $(date +%Y-%m-%d) [skip ci]"
+                fi
+              fi
+              
+              echo "=== Sync completed ==="
+              echo "New HEAD: $(git rev-parse HEAD)"
+            displayName: 'Sync from upstream'
+
+          - script: |
+              echo "=== Checking for changes to push ==="
+              git status
+              
+              LOCAL=$(git rev-parse HEAD)
+              REMOTE=$(git rev-parse origin/$(targetBranch) 2>/dev/null || echo "")
+              
+              echo "Local HEAD: $LOCAL"
+              echo "Remote HEAD: $REMOTE"
+              
+              if [ "$LOCAL" != "$REMOTE" ]; then
+                echo "=== Pushing changes to origin ==="
+                git push origin HEAD:$(targetBranch)
+                echo "Push completed"
+              else
+                echo "No changes to push, already synchronized"
+              fi
+            displayName: 'Push to remote'
+            condition: succeeded()
+
+          - script: |
+              echo "=== Final status report ==="
+              UPSTREAM_BRANCH=$(curl -s "$(upstreamApiUrl)" | jq -r '.default_branch')
+              
+              echo "Azure DevOps HEAD: $(git rev-parse HEAD)"
+              echo "GitHub Upstream HEAD: $(git rev-parse upstream/$UPSTREAM_BRANCH)"
+              
+              if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/$UPSTREAM_BRANCH)" ]; then
+                echo "SUCCESS: Azure DevOps is synchronized with GitHub upstream"
+              else
+                echo "WARNING: Still have divergence from upstream"
+                echo "Local-only commits:"
+                git log --oneline upstream/$UPSTREAM_BRANCH..HEAD
+              fi
+            displayName: 'Status report'
+            condition: always()
