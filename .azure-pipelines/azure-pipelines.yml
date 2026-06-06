@@ -1,23 +1,23 @@
-# Azure Pipeline: Sync upstream from GitHub to Azure DevOps main
+# Azure Pipeline: Sync upstream from GitHub to Azure DevOps master
 # Fixes: fetchDepth issue that prevented proper merge
 
 trigger:
   branches:
     include:
-      - main
+      - master
 
 schedules:
   - cron: "0 0 * * *"
     displayName: "Sync upstream daily at midnight"
     branches:
       include:
-        - main
+        - master
     always: true
 
 variables:
   # Change these when copying to another project
   upstreamOwnerRepo: 'darktable-org/darktable'  # GitHub owner/repo path
-  targetBranch: 'main'
+  targetBranch: 'master'
 
   # Derived variables (don't change)
   upstreamRepo: 'https://github.com/$(upstreamOwnerRepo).git'
