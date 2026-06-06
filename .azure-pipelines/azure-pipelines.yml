@@ -63,59 +63,32 @@ stages:
           - script: |
               echo "=== Checking if already up-to-date ==="
               UPSTREAM_BRANCH=$(curl -s "$(upstreamApiUrl)" | jq -r '.default_branch')
-              
+
               LOCAL=$(git rev-parse HEAD)
               UPSTREAM=$(git rev-parse upstream/$UPSTREAM_BRANCH)
-              
+
               if [ "$LOCAL" = "$UPSTREAM" ]; then
                 echo "Already up-to-date, no sync needed"
                 exit 0
               fi
-              
-              echo "=== Checking merge base ==="
-              MERGE_BASE=$(git merge-base HEAD upstream/$UPSTREAM_BRANCH 2>/dev/null || echo "")
-              
-              if [ -z "$MERGE_BASE" ]; then
-                echo "=== No common ancestor, doing hard reset ==="
-                git reset --hard upstream/$UPSTREAM_BRANCH
-                
-                # Preserve CI config
-                echo "=== Restoring CI config ==="
-                git checkout HEAD -- .azure-pipelines/ || true
-                if [ -n "$(git status --porcelain)" ]; then
-                  git add .azure-pipelines/
-                  git commit -m "Restore CI config [skip ci]"
-                fi
-              else
-                echo "=== Have common ancestor: $MERGE_BASE ==="
-                
-                # Check if we're behind upstream
-                BEHIND=$(git rev-list --count HEAD..upstream/$UPSTREAM_BRANCH)
-                AHEAD=$(git rev-list --count upstream/$UPSTREAM_BRANCH..HEAD)
-                
-                echo "Behind upstream by: $BEHIND commits"
-                echo "Ahead of upstream by: $AHEAD commits"
-                
-                if [ "$BEHIND" -gt 0 ] && [ "$AHEAD" -eq 0 ]; then
-                  echo "=== Fast-forward possible, resetting to upstream ==="
-                  git reset --hard upstream/$UPSTREAM_BRANCH
-                  
-                  # Preserve CI config if it exists locally
-                  echo "=== Checking for local CI config ==="
-                  git stash push -m "CI config backup" .azure-pipelines/ 2>/dev/null || true
-                  git reset --hard upstream/$UPSTREAM_BRANCH
-                  git stash pop 2>/dev/null || true
-                  
-                  if [ -n "$(git status --porcelain)" ]; then
-                    git add .azure-pipelines/
-                    git commit -m "Preserve CI config during sync [skip ci]"
-                  fi
-                elif [ "$BEHIND" -gt 0 ]; then
-                  echo "=== Need to merge upstream changes ==="
-                  git merge upstream/$UPSTREAM_BRANCH --no-edit -m "Merge upstream $(date +%Y-%m-%d) [skip ci]"
-                fi
+
+              echo "=== Backing up CI config ==="
+              mkdir -p /tmp/ci-backup
+              cp -r .azure-pipelines/* /tmp/ci-backup/ 2>/dev/null || true
+
+              echo "=== Hard reset to upstream ==="
+              git reset --hard upstream/$UPSTREAM_BRANCH
+
+              echo "=== Restoring CI config ==="
+              mkdir -p .azure-pipelines
+              cp -r /tmp/ci-backup/* .azure-pipelines/ 2>/dev/null || true
+              rm -rf /tmp/ci-backup
+
+              if [ -n "$(git status --porcelain .azure-pipelines/)" ]; then
+                git add .azure-pipelines/
+                git commit -m "Preserve CI config during sync [skip ci]"
               fi
-              
+
               echo "=== Sync completed ==="
               echo "New HEAD: $(git rev-parse HEAD)"
             displayName: 'Sync from upstream'
