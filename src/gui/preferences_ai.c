@@ -20,6 +20,7 @@
 #include "bauhaus/bauhaus.h"
 #include "dtgtk/button.h"
 #include "dtgtk/paint.h"
+#include "dtgtk/paint_cell.h"
 #include "ai/backend.h"
 #include "common/ai_models.h"
 #include "common/darktable.h"
@@ -69,7 +70,7 @@ enum
 {
   COL_SELECTED,
   COL_NAME,
-  COL_INFO,     // info icon column (static "ⓘ" text)
+  COL_INFO,     // info icon visibility flag (TRUE on downloaded rows)
   COL_VERSION,
   COL_TASK,
   COL_ENABLED,
@@ -249,14 +250,14 @@ static void _refresh_model_list(dt_prefs_ai_data_t *data)
 
   gtk_list_store_clear(data->model_store);
 
-  dt_ai_models_refresh_status(darktable.ai_registry);
-  dt_ai_models_check_updates(darktable.ai_registry);
+  dt_ai_models_refresh_status();
+  dt_ai_models_check_updates();
 
-  const int count = dt_ai_models_get_count(darktable.ai_registry);
+  const int count = dt_ai_models_get_count();
   dt_print(DT_DEBUG_AI, "[preferences_ai] refreshing model list, count=%d", count);
   for(int i = 0; i < count; i++)
   {
-    dt_ai_model_t *model = dt_ai_models_get_by_index(darktable.ai_registry, i);
+    dt_ai_model_t *model = dt_ai_models_get_by_index(i);
     if(!model)
     {
       dt_print(DT_DEBUG_AI, "[preferences_ai] model at index %d is NULL", i);
@@ -304,8 +305,7 @@ static void _refresh_model_list(dt_prefs_ai_data_t *data)
         ? (model->version ? model->version : "0.0") : "–",
       COL_ID,
       model->id,
-      COL_INFO,
-      is_downloaded ? "\xe2\x93\x98" : "",  // U+24D8 CIRCLED LATIN SMALL LETTER I
+      COL_INFO, is_downloaded,
       -1);
     dt_ai_model_free(model);
   }
@@ -668,14 +668,12 @@ static void _on_enable_toggled(GtkWidget *widget, gpointer user_data)
   dt_conf_set_bool("plugins/ai/enabled", enabled);
   if(darktable.ai_registry)
   {
-    g_mutex_lock(&darktable.ai_registry->lock);
-    darktable.ai_registry->ai_enabled = enabled;
-    g_mutex_unlock(&darktable.ai_registry->lock);
+    dt_ai_registry_set_enabled(enabled);
 
     // lazy-init directories + models on first enable
     if(enabled)
     {
-      dt_ai_models_init_lazy(darktable.ai_registry);
+      dt_ai_models_init_lazy();
       _refresh_model_list(data);
     }
   }
@@ -921,7 +919,7 @@ static void _update_provider_status(dt_prefs_ai_data_t *data,
 
   // don't probe GPU providers when AI is disabled —
   // initializing MIGraphX/ROCm on unsupported GPUs can abort()
-  if(!darktable.ai_registry || !darktable.ai_registry->ai_enabled)
+  if(!dt_ai_registry_is_enabled())
   {
     gtk_label_set_text(GTK_LABEL(data->provider_status), "");
     return;
@@ -956,12 +954,7 @@ static void _on_provider_changed(GtkWidget *widget, gpointer user_data)
   const int combo_idx = dt_bauhaus_combobox_get(widget);
   const int pi = _combo_idx_to_provider(combo_idx, data->supported_providers);
   dt_conf_set_string(DT_AI_CONF_PROVIDER, dt_ai_providers[pi].config_string);
-  if(darktable.ai_registry)
-  {
-    g_mutex_lock(&darktable.ai_registry->lock);
-    darktable.ai_registry->provider = dt_ai_providers[pi].value;
-    g_mutex_unlock(&darktable.ai_registry->lock);
-  }
+  dt_ai_registry_set_provider(dt_ai_providers[pi].value);
   _update_string_indicator(data->provider_indicator, DT_AI_CONF_PROVIDER);
   _update_provider_status(data, dt_ai_providers[pi].value);
 }
@@ -1150,7 +1143,6 @@ static gboolean _update_progress_idle(gpointer user_data)
   g_mutex_lock(&dl->mutex);
   double progress = dl->progress;
   gboolean finished = dl->finished;
-  char *error = dl->error ? g_strdup(dl->error) : NULL;
   g_mutex_unlock(&dl->mutex);
 
   if(dl->dialog && GTK_IS_WIDGET(dl->dialog))
@@ -1166,18 +1158,11 @@ static gboolean _update_progress_idle(gpointer user_data)
   if(finished && !dl->finish_handled && dialog_alive)
   {
     dl->finish_handled = TRUE;
-    if(error)
-    {
-      gtk_label_set_text(GTK_LABEL(dl->status_label), error);
-      gtk_widget_show(dl->status_label);
-    }
-    else
-    {
-      gtk_dialog_response(GTK_DIALOG(dl->dialog), GTK_RESPONSE_OK);
-    }
+    // close the progress dialog in both cases — error is surfaced as
+    // a standard message dialog by the caller after the thread joins
+    gtk_dialog_response(GTK_DIALOG(dl->dialog), GTK_RESPONSE_OK);
   }
 
-  g_free(error);
   // removal is owned by the caller; returning G_SOURCE_REMOVE here
   // would race with that explicit remove
   return G_SOURCE_CONTINUE;
@@ -1189,7 +1174,6 @@ static gpointer _download_thread_func(gpointer user_data)
   dt_download_dialog_t *dl = (dt_download_dialog_t *)user_data;
 
   char *error = dt_ai_models_download_sync(
-    darktable.ai_registry,
     dl->model_id,
     _download_progress_callback,
     dl,
@@ -1207,7 +1191,7 @@ static gpointer _download_thread_func(gpointer user_data)
 static gboolean
 _download_model_with_dialog(dt_prefs_ai_data_t *data, const char *model_id)
 {
-  dt_ai_model_t *model = dt_ai_models_get_by_id(darktable.ai_registry, model_id);
+  dt_ai_model_t *model = dt_ai_models_get_by_id(model_id);
   if(!model)
     return FALSE;
 
@@ -1290,6 +1274,19 @@ _download_model_with_dialog(dt_prefs_ai_data_t *data, const char *model_id)
   // notify modules that models have changed
   if(success)
     DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_AI_MODELS_CHANGED);
+  else if(response != GTK_RESPONSE_CANCEL)
+  {
+    // download failed (not user-cancelled) — surface in a standard error dialog
+    GtkWidget *err = gtk_message_dialog_new(
+      GTK_WINDOW(data->parent_dialog),
+      GTK_DIALOG_MODAL,
+      GTK_MESSAGE_ERROR,
+      GTK_BUTTONS_OK,
+      "%s", dl->error);
+    gtk_window_set_title(GTK_WINDOW(err), _("model download failed"));
+    gtk_dialog_run(GTK_DIALOG(err));
+    gtk_widget_destroy(err);
+  }
 
   // clean up
   g_mutex_clear(&dl->mutex);
@@ -1308,7 +1305,7 @@ static void _on_download_selected(GtkButton *button, gpointer user_data)
   for(GList *l = ids; l; l = g_list_next(l))
   {
     const char *id = (const char *)l->data;
-    dt_ai_model_t *model = dt_ai_models_get_by_id(darktable.ai_registry, id);
+    dt_ai_model_t *model = dt_ai_models_get_by_id(id);
     if(model)
     {
       gboolean need_download = (model->status == DT_AI_MODEL_NOT_DOWNLOADED
@@ -1328,10 +1325,10 @@ static void _on_download_default(GtkButton *button, gpointer user_data)
   dt_prefs_ai_data_t *data = (dt_prefs_ai_data_t *)user_data;
 
   // download default models that need downloading
-  const int count = dt_ai_models_get_count(darktable.ai_registry);
+  const int count = dt_ai_models_get_count();
   for(int i = 0; i < count; i++)
   {
-    dt_ai_model_t *model = dt_ai_models_get_by_index(darktable.ai_registry, i);
+    dt_ai_model_t *model = dt_ai_models_get_by_index(i);
     if(!model)
       continue;
     gboolean need_download
@@ -1390,7 +1387,7 @@ static void _on_install_model(GtkButton *button, gpointer user_data)
   for(GSList *l = files; l; l = l->next)
   {
     const char *filepath = (const char *)l->data;
-    char *error = dt_ai_models_install_local(darktable.ai_registry, filepath);
+    char *error = dt_ai_models_install_local(filepath);
     if(error)
     {
       gchar *base = g_path_get_basename(filepath);
@@ -1437,7 +1434,7 @@ static void _on_delete_selected(GtkButton *button, gpointer user_data)
   for(GList *l = ids; l; l = g_list_next(l))
   {
     const char *id = (const char *)l->data;
-    dt_ai_model_t *model = dt_ai_models_get_by_id(darktable.ai_registry, id);
+    dt_ai_model_t *model = dt_ai_models_get_by_id(id);
     if(model)
     {
       if(model->status == DT_AI_MODEL_DOWNLOADED
@@ -1474,7 +1471,7 @@ static void _on_delete_selected(GtkButton *button, gpointer user_data)
     {
       const char *model_id = (const char *)l->data;
       // check if this model is the active one for its task before deleting
-      dt_ai_model_t *model = dt_ai_models_get_by_id(darktable.ai_registry, model_id);
+      dt_ai_model_t *model = dt_ai_models_get_by_id(model_id);
       if(model && model->task && model->task[0])
       {
         char *active = dt_ai_models_get_active_for_task(model->task);
@@ -1489,7 +1486,7 @@ static void _on_delete_selected(GtkButton *button, gpointer user_data)
       }
       if(model) dt_ai_model_free(model);
 
-      if(dt_ai_models_delete(darktable.ai_registry, model_id))
+      if(dt_ai_models_delete(model_id))
       {
         dt_print(DT_DEBUG_AI, "[preferences_ai] deleted model: %s", model_id);
         any_deleted = TRUE;
@@ -1512,7 +1509,7 @@ static void _show_model_card(dt_prefs_ai_data_t *data,
   if(!model_id || !model_id[0]) return;
 
   const char *dash = "\xe2\x80\x93";  // en dash for missing fields
-  dt_ai_model_card_t *card = dt_ai_models_get_card(darktable.ai_registry, model_id);
+  dt_ai_model_card_t *card = dt_ai_models_get_card(model_id);
 
   const char *name = (card && card->name)
     ? card->name : model_id;
@@ -1603,12 +1600,9 @@ static gboolean _info_active_at_bin(dt_prefs_ai_data_t *data,
      && column == data->info_col)
   {
     GtkTreeIter iter;
-    gchar *info = NULL;
     if(gtk_tree_model_get_iter(GTK_TREE_MODEL(data->model_store), &iter, path))
       gtk_tree_model_get(GTK_TREE_MODEL(data->model_store),
-                         &iter, COL_INFO, &info, -1);
-    active = (info && info[0]);
-    g_free(info);
+                         &iter, COL_INFO, &active, -1);
   }
   if(path) gtk_tree_path_free(path);
   return active;
@@ -1693,13 +1687,12 @@ static gboolean _on_info_button_press(GtkWidget *widget,
   if(gtk_tree_model_get_iter(GTK_TREE_MODEL(data->model_store), &iter, path))
   {
     gchar *model_id = NULL;
-    gchar *info = NULL;
+    gboolean has_info = FALSE;
     gtk_tree_model_get(GTK_TREE_MODEL(data->model_store),
-                       &iter, COL_ID, &model_id, COL_INFO, &info, -1);
-    if(model_id && info && info[0])
+                       &iter, COL_ID, &model_id, COL_INFO, &has_info, -1);
+    if(model_id && has_info)
       _show_model_card(data, model_id);
     g_free(model_id);
-    g_free(info);
   }
   gtk_tree_path_free(path);
   return TRUE;
@@ -1788,7 +1781,7 @@ static void _on_detect_system_ort(GtkButton *button, gpointer user_data)
     for(GList *l = found; l; l = g_list_next(l))
     {
       dt_ai_ort_found_t *f = l->data;
-      gchar *entry = g_strdup_printf("ORT %s [%s]  %s", f->version, f->eps, f->path);
+      gchar *entry = g_strdup_printf("ONNX Runtime %s [%s]  %s", f->version, f->eps, f->path);
       gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), entry);
       g_free(entry);
     }
@@ -2097,7 +2090,7 @@ void init_tab_ai(GtkWidget *dialog, GtkWidget *stack)
     NUM_COLS,
     G_TYPE_BOOLEAN, // selected
     G_TYPE_STRING,  // name
-    G_TYPE_STRING,  // info icon
+    G_TYPE_BOOLEAN, // info icon visible
     G_TYPE_STRING,  // version
     G_TYPE_STRING,  // task
     G_TYPE_BOOLEAN, // enabled
@@ -2166,11 +2159,12 @@ void init_tab_ai(GtkWidget *dialog, GtkWidget *stack)
   gtk_tree_view_append_column(GTK_TREE_VIEW(data->model_list), name_col);
 
   // info icon column — click opens model card
-  GtkCellRenderer *info_renderer = gtk_cell_renderer_text_new();
+  GtkCellRenderer *info_renderer
+    = dtgtk_paint_cell_new(dtgtk_cairo_paint_info, 0, NULL);
   data->info_col = gtk_tree_view_column_new_with_attributes(
     "",
     info_renderer,
-    "text",
+    "visible",
     COL_INFO,
     NULL);
   gtk_tree_view_column_set_clickable(data->info_col, FALSE);

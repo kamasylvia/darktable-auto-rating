@@ -1100,27 +1100,27 @@ static int _ensure_raw_ctx(dt_neural_job_t *j,
     dt_restore_unref(j->ctx);
     j->ctx = NULL;
   }
-  const char *label = NULL;
+  const char *message = NULL;
   switch(cls)
   {
     case DT_RESTORE_SENSOR_CLASS_BAYER:
       j->ctx = dt_restore_load_rawdenoise_bayer(j->env);
-      label = _("bayer");
+      message = _("failed to load AI model for Bayer raw denoising");
       break;
     case DT_RESTORE_SENSOR_CLASS_XTRANS:
       j->ctx = dt_restore_load_rawdenoise_xtrans(j->env);
-      label = _("x-trans");
+      message = _("failed to load AI model for X-Trans raw denoising");
       break;
     case DT_RESTORE_SENSOR_CLASS_LINEAR:
       j->ctx = dt_restore_load_rawdenoise_linear(j->env);
-      label = _("linear");
+      message = _("failed to load AI model for linear raw denoising");
       break;
     default:
       return 1;
   }
   if(!j->ctx)
   {
-    dt_control_log(_("failed to load AI raw denoise %s model"), label);
+    dt_control_log(message, (char* )NULL);
     return 1;
   }
   j->raw_ctx_sensor_class = cls;
@@ -1224,6 +1224,7 @@ static int _process_raw_denoise_bayer(dt_neural_job_t *j,
   g_free(jpeg_buf);
   g_free(exif_blob);
   g_free(cfa_out);
+  if(res != 0) g_unlink(out_filename);
   return res;
 }
 
@@ -1275,6 +1276,7 @@ static int _process_raw_denoise_linear(dt_neural_job_t *j,
   g_free(jpeg_buf);
   g_free(exif_blob);
   dt_free_align(rgb);
+  if(res != 0) g_unlink(out_filename);
   return res;
 }
 
@@ -1322,7 +1324,7 @@ static int _process_raw_denoise_one(dt_neural_job_t *j,
 
   if(cls == DT_RESTORE_SENSOR_CLASS_UNSUPPORTED)
   {
-    dt_control_log(_("raw denoise: image is not a supported raw sensor format"));
+    dt_control_log(_("raw denoise: image is not in a supported raw sensor format"));
     return 1;
   }
 
@@ -2275,6 +2277,11 @@ static void _cancel_preview(dt_lib_module_t *self)
   d->export_pixels = NULL;
   g_free(d->export_cairo);
   d->export_cairo = NULL;
+  // raw-denoise crops — strength slider would otherwise reblend stale
+  g_free(d->preview_raw_src_rgb);
+  d->preview_raw_src_rgb = NULL;
+  g_free(d->preview_raw_denoised_rgb);
+  d->preview_raw_denoised_rgb = NULL;
   d->picking_thumbnail = FALSE;
   gtk_widget_queue_draw(d->preview_area);
 }
@@ -2841,6 +2848,12 @@ static gpointer _preview_thread_raw(gpointer data)
     gchar *cfg_file = (cfg_type == DT_COLORSPACE_FILE)
       ? dt_conf_get_string(CONF_ICC_FILE)
       : NULL;
+    const dt_colorspaces_color_profile_t *work_cp
+      = dt_colorspaces_get_work_profile(pd->imgid);
+    const dt_colorspaces_color_profile_type_t dst_type
+      = (cfg_type == DT_COLORSPACE_NONE)
+        ? (work_cp ? work_cp->type : DT_COLORSPACE_LIN_REC2020)
+        : cfg_type;
     dt_imageio_export_with_flags(
       pd->imgid, "unused", &fmt,
       (dt_imageio_module_data_t *)&cap,
@@ -2854,9 +2867,7 @@ static gpointer _preview_thread_raw(gpointer data)
       NULL,   // filter
       FALSE,  // copy_metadata
       FALSE,  // export_masks
-      (cfg_type == DT_COLORSPACE_NONE)
-        ? dt_colorspaces_get_work_profile(pd->imgid)->type
-        : cfg_type,
+      dst_type,
       cfg_file,
       DT_INTENT_PERCEPTUAL,
       NULL, NULL, 1, 1, NULL, -1);
@@ -3077,6 +3088,8 @@ static void _trigger_preview(dt_lib_module_t *self)
   if(!d->model_available || !d->preview_requested)
     return;
 
+  if(dt_view_get_current() == DT_VIEW_DARKROOM) dt_dev_write_history(darktable.develop);
+
   // invalidate current preview and bump sequence so running thread exits early
   d->preview_ready = FALSE;
   d->preview_error = DT_NR_PREVIEW_ERR_NONE;
@@ -3247,6 +3260,8 @@ static void _process_clicked(GtkWidget *widget, gpointer user_data)
   GList *images = dt_act_on_get_images(TRUE, TRUE, FALSE);
   if(!images)
     return;
+
+  if(dt_view_get_current() == DT_VIEW_DARKROOM) dt_dev_write_history(darktable.develop);
 
   dt_neural_job_t *job_data = g_new0(dt_neural_job_t, 1);
   job_data->task = d->task;
@@ -3794,6 +3809,10 @@ static gboolean _preview_draw(GtkWidget *widget,
   return FALSE;
 }
 
+// pointer within this distance of the divider shows the resize cursor;
+// clicks within this distance grip the divider without snapping it
+#define PREVIEW_DIVIDER_NEAR_PX  3.0
+
 static gboolean _preview_button_press(GtkWidget *widget,
                                       GdkEventButton *event,
                                       dt_lib_module_t *self)
@@ -3876,13 +3895,18 @@ static gboolean _preview_button_press(GtkWidget *widget,
   const double ox = (w - pw * scale) / 2.0;
   const double div_x = ox + d->split_pos * pw * scale;
 
-  if(fabs(ex - div_x) < 8.0)
+  if(fabs(ex - div_x) < PREVIEW_DIVIDER_NEAR_PX)
   {
+    // precision grip on the divider — drag without snapping
     d->dragging_split = TRUE;
     return TRUE;
   }
 
-  return FALSE;
+  // click anywhere else snaps the divider then enters drag
+  d->split_pos = CLAMP((ex - ox) / (pw * scale), 0.0, 1.0);
+  d->dragging_split = TRUE;
+  gtk_widget_queue_draw(widget);
+  return TRUE;
 }
 
 static gboolean _preview_button_release(GtkWidget *widget,
@@ -3970,7 +3994,7 @@ static gboolean _preview_motion(GtkWidget *widget,
     GdkWindow *win = gtk_widget_get_window(widget);
     if(win)
     {
-      const gboolean near = fabs(ex - div_x) < 8.0;
+      const gboolean near = fabs(ex - div_x) < PREVIEW_DIVIDER_NEAR_PX;
       if(near)
       {
         GdkCursor *cursor = gdk_cursor_new_from_name(
