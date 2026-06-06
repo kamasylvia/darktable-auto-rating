@@ -5,6 +5,7 @@ trigger:
   branches:
     include:
       - master
+      - main
 
 schedules:
   - cron: "0 0 * * *"
@@ -12,12 +13,13 @@ schedules:
     branches:
       include:
         - master
+        - main
     always: true
 
 variables:
   # Change these when copying to another project
   upstreamOwnerRepo: 'darktable-org/darktable'  # GitHub owner/repo path
-  targetBranch: 'master'
+  targetBranch: $(Build.SourceBranchName)
 
   # Derived variables (don't change)
   upstreamRepo: 'https://github.com/$(upstreamOwnerRepo).git'
